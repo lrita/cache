@@ -163,6 +163,98 @@ func BenchmarkCacheOverflowUnbalanced(b *testing.B) {
 	})
 }
 
+func BenchmarkCacheSize100(b *testing.B) {
+	c := Cache{Size: 100}
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			c.Put(1)
+			c.Get()
+		}
+	})
+}
+
+func BenchmarkCacheSize100Overflow(b *testing.B) {
+	c := Cache{Size: 100}
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			for b := 0; b < 100; b++ {
+				c.Put(1)
+			}
+			for b := 0; b < 100; b++ {
+				c.Get()
+			}
+		}
+	})
+}
+
+func BenchmarkCacheSize100UnderflowUnbalanced(b *testing.B) {
+	p := Cache{Size: 100}
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			p.Put(1)
+			p.Get()
+			p.Get()
+		}
+	})
+}
+
+func BenchmarkCacheSize100OverflowUnbalanced(b *testing.B) {
+	p := Cache{Size: 100}
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			p.Put(1)
+			p.Put(1)
+			p.Get()
+		}
+	})
+}
+
+func BenchmarkCacheSize1K(b *testing.B) {
+	c := Cache{Size: 1024}
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			c.Put(1)
+			c.Get()
+		}
+	})
+}
+
+func BenchmarkCacheSize1KOverflow(b *testing.B) {
+	c := Cache{Size: 1024}
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			for b := 0; b < 100; b++ {
+				c.Put(1)
+			}
+			for b := 0; b < 100; b++ {
+				c.Get()
+			}
+		}
+	})
+}
+
+func BenchmarkCacheSize1KUnderflowUnbalanced(b *testing.B) {
+	p := Cache{Size: 1024}
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			p.Put(1)
+			p.Get()
+			p.Get()
+		}
+	})
+}
+
+func BenchmarkCacheSize1KOverflowUnbalanced(b *testing.B) {
+	p := Cache{Size: 1024}
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			p.Put(1)
+			p.Put(1)
+			p.Get()
+		}
+	})
+}
+
 func BenchmarkSyncPool(b *testing.B) {
 	var c sync.Pool
 	b.RunParallel(func(pb *testing.PB) {

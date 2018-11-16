@@ -40,8 +40,10 @@ type Cache struct {
 	local     unsafe.Pointer // local fixed-size per-P pool, actual type is [P]poolLocal
 	localSize uintptr        // size of the local array
 
-	globalSzie  int         // size of the items in globalFull list
+	globalSzie  int64       // size of the items in globalFull list
+	_           [7]int64    // pad cacheline
 	globalLock  uintptr     // mutex for access to globalFull/globalEmpty
+	_           [7]int64    // pad cacheline
 	globalFull  *cacheShard // global pool of full shards (elems==cacheShardSize)
 	globalEmpty *cacheShard // global pool of full shards (elems==cacheShardSize)
 
@@ -50,7 +52,7 @@ type Cache struct {
 	// a value when Get would otherwise return nil.
 	// It may not be changed concurrently with calls to Get.
 	New  func() interface{}
-	Size int
+	Size int64
 }
 
 const (
@@ -91,7 +93,7 @@ func (c *Cache) Put(x interface{}) {
 	} else if next := l.next; next != nil && next.elems < cacheShardSize {
 		next.elem[next.elems] = x
 		next.elems++
-	} else if c.globalLockIfUnlocked() {
+	} else if atomic.LoadInt64(&c.globalSzie) < c.Size && c.globalLockIfUnlocked() {
 		// There is no space in the private pool but we were able to acquire
 		// the globalLock, so we can try to move shards to/from the global pools.
 		if full := l.next; full != nil {
@@ -99,7 +101,7 @@ func (c *Cache) Put(x interface{}) {
 			l.next = nil
 			full.next = c.globalFull
 			c.globalFull = full
-			c.globalSzie += cacheShardSize
+			atomic.AddInt64(&c.globalSzie, cacheShardSize)
 		}
 		if c.globalSzie < c.Size {
 			if empty := c.globalEmpty; empty != nil {
@@ -145,7 +147,7 @@ func (c *Cache) Get() (x interface{}) {
 	} else if next := l.next; next != nil && next.elems > 0 {
 		next.elems--
 		x = next.elem[next.elems]
-	} else if c.globalLockIfUnlocked() {
+	} else if atomic.LoadInt64(&c.globalSzie) > 0 && c.globalLockIfUnlocked() {
 		// The private pool is empty but we were able to acquire the globalLock,
 		// so we can try to move shards to/from the global pools.
 		if empty := l.next; empty != nil {
@@ -159,7 +161,7 @@ func (c *Cache) Get() (x interface{}) {
 			c.globalFull = full.next
 			full.next = nil
 			l.next = full
-			c.globalSzie -= cacheShardSize
+			atomic.AddInt64(&c.globalSzie, -cacheShardSize)
 			full.elems--
 			x = full.elem[full.elems]
 		}
