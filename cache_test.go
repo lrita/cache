@@ -10,7 +10,14 @@ package cache
 import (
 	"sync"
 	"testing"
+	"unsafe"
 )
+
+func TestAlign(t *testing.T) {
+	if unsafe.Sizeof(cacheShard{})%128 != 0 {
+		t.Fatal("cacheShard is not aligned with 128")
+	}
+}
 
 func TestPool(t *testing.T) {
 	var c Cache
@@ -139,6 +146,7 @@ func BenchmarkCacheOverflow(b *testing.B) {
 			}
 		}
 	})
+	b.Log("missing", c.Missing())
 }
 
 func BenchmarkCacheUnderflowUnbalanced(b *testing.B) {
@@ -185,6 +193,7 @@ func BenchmarkCacheSize100Overflow(b *testing.B) {
 			}
 		}
 	})
+	b.Log("missing", c.Missing())
 }
 
 func BenchmarkCacheSize100UnderflowUnbalanced(b *testing.B) {
@@ -231,6 +240,7 @@ func BenchmarkCacheSize1KOverflow(b *testing.B) {
 			}
 		}
 	})
+	b.Log("missing", c.Missing())
 }
 
 func BenchmarkCacheSize1KUnderflowUnbalanced(b *testing.B) {

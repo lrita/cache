@@ -1,4 +1,4 @@
-// Copyright 2013 The Go Authors. All rights reserved.
+// Copyright 2018 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -26,59 +26,58 @@ import (
 // clients of a package. Cache provides a way to amortize allocation overhead
 // across many clients.
 //
-// The difference with std-lib sync.Pool is that the items in Cache does not
+// The difference with std-lib sync.Pool is that the items in Cache does not be
 // deallocated by GC, and there are multi slot in per-P storage. The free list
 // in Cache maintained as parts of a long-lived object aim for a long process
-// logic.
-//
-// Cache implemention is forked from https://go-review.googlesource.com/c/go/+/100036
+// logic. The users can twist the per-P local size(Cache.Size) to make minimum
+// allocation by the Get-missing statistic method Cache.Missing().
 //
 // A Cache must not be copied after first use.
 type Cache struct {
 	noCopy noCopy
 
-	local     unsafe.Pointer // local fixed-size per-P pool, actual type is [P]poolLocal
+	local     unsafe.Pointer // local fixed-size per-P pool, actual type is [P]cacheLocal
 	localSize uintptr        // size of the local array
-
-	globalSzie  int64       // size of the items in globalFull list
-	_           [7]int64    // pad cacheline
-	globalLock  uintptr     // mutex for access to globalFull/globalEmpty
-	_           [7]int64    // pad cacheline
-	globalFull  *cacheShard // global pool of full shards (elems==cacheShardSize)
-	globalEmpty *cacheShard // global pool of full shards (elems==cacheShardSize)
 
 	mu sync.Mutex
 	// New optionally specifies a function to generate
 	// a value when Get would otherwise return nil.
 	// It may not be changed concurrently with calls to Get.
-	New  func() interface{}
+	New func() interface{}
+	// Size optinally specifies the max items in the per-P local lists.
 	Size int64
 }
 
 const (
-	globalLocked   uintptr = 1
-	globalUnlocked         = 0
-
 	// interface{} is 16 bytes wide on 64bit platforms,
 	// leaving only 7 slots per 128 bytes cache line.
 	cacheShardSize = 7 // number of elements per shard
 )
 
-type cacheShardInternal struct {
+// due to https://github.com/golang/go/issues/14620, in some situation, we
+// cannot make the object aligned by composited.
+type cacheShard struct {
 	elems int
 	elem  [cacheShardSize]interface{}
 	next  *cacheShard
 }
 
-type cacheShard struct {
-	cacheShardInternal
+type cacheLocalInternal struct {
+	cacheShard
 
-	// Prevents false sharing on widespread platforms with
-	// 128 mod (cache line size) = 0.
-	_ [128 - unsafe.Sizeof(cacheShardInternal{})%128]byte
+	localSize  int64       // local size of full shards
+	localFull  *cacheShard // local pool of full shards (elems == cacheShardSize)
+	localEmpty *cacheShard // local pool of empty shards (elems == 0)
+	_          [5]int64    // pad cacheline
+	missing    int64       // local missing count
 }
 
-type cacheLocal cacheShard
+type cacheLocal struct {
+	cacheLocalInternal
+	// Prevents false sharing on widespread platforms with
+	// 128 mod (cache line size) = 0.
+	_ [128 - unsafe.Sizeof(cacheLocalInternal{})%128]byte
+}
 
 // Put adds x to the Cache.
 func (c *Cache) Put(x interface{}) {
@@ -93,38 +92,27 @@ func (c *Cache) Put(x interface{}) {
 	} else if next := l.next; next != nil && next.elems < cacheShardSize {
 		next.elem[next.elems] = x
 		next.elems++
-	} else if atomic.LoadInt64(&c.globalSzie) < c.Size && c.globalLockIfUnlocked() {
-		// There is no space in the private pool but we were able to acquire
-		// the globalLock, so we can try to move shards to/from the global pools.
+	} else if l.localSize < c.Size {
 		if full := l.next; full != nil {
-			// The l.next shard is full: move it to the global pool.
+			// The l.next shard is full: move it to the full list.
 			l.next = nil
-			full.next = c.globalFull
-			c.globalFull = full
-			atomic.AddInt64(&c.globalSzie, cacheShardSize)
+			full.next = l.localFull
+			l.localFull = full
+			l.localSize += cacheShardSize
 		}
-		if c.globalSzie < c.Size {
-			if empty := c.globalEmpty; empty != nil {
-				// Grab a reusable empty shard from the globalEmpty pool and move it
-				// to the private pool.
-				c.globalEmpty = empty.next
-				empty.next = nil
-				l.next = empty
-				c.globalUnlock()
-			} else {
-				// The globalEmpty pool contains no reusable shards: allocate a new
-				// empty shard.
-				//	globalSize:=c.globalSzie
-				c.globalUnlock()
-				l.next = &cacheShard{}
-			}
-			l.next.elem[0] = x
-			l.next.elems = 1
+		if empty := l.localEmpty; empty != nil {
+			// Grab a reusable empty shard from the localEmpty list and move it
+			// to the private pool.
+			l.localEmpty = empty.next
+			empty.next = nil
+			l.next = empty
 		} else {
-			// this Cache is full, drop it on the floor.
-			c.globalUnlock()
+			// No reusable shards: allocate a new empty shard.
+			l.next = &cacheShard{}
 		}
-	} // else: We could not acquire the globalLock to recycle x: drop it on the floor.
+		l.next.elem[0] = x
+		l.next.elems = 1
+	} // else: drop it on the floor.
 
 	runtime_procUnpin()
 	// TODO RACE
@@ -143,30 +131,30 @@ func (c *Cache) Get() (x interface{}) {
 	l := c.pin()
 	if l.elems > 0 {
 		l.elems--
-		x = l.elem[l.elems]
+		x, l.elem[l.elems] = l.elem[l.elems], nil
 	} else if next := l.next; next != nil && next.elems > 0 {
 		next.elems--
-		x = next.elem[next.elems]
-	} else if atomic.LoadInt64(&c.globalSzie) > 0 && c.globalLockIfUnlocked() {
-		// The private pool is empty but we were able to acquire the globalLock,
-		// so we can try to move shards to/from the global pools.
+		x, next.elem[next.elems] = next.elem[next.elems], nil
+	} else if l.localSize > 0 {
 		if empty := l.next; empty != nil {
-			// The l.next shard is empty: move it to the globalFree pool.
+			// The l.next shard is empty: move it to the localEmpty list.
 			l.next = nil
-			empty.next = c.globalEmpty
-			c.globalEmpty = empty
+			empty.next = l.localEmpty
+			l.localEmpty = empty
 		}
-		// Grab full shard from global pool and obtain x from it.
-		if full := c.globalFull; full != nil {
-			c.globalFull = full.next
+		// Grab full shard from localFull
+		if full := l.localFull; full != nil {
+			l.localFull = full.next
 			full.next = nil
 			l.next = full
-			atomic.AddInt64(&c.globalSzie, -cacheShardSize)
+			l.localSize -= cacheShardSize
 			full.elems--
-			x = full.elem[full.elems]
+			x, full.elem[full.elems] = full.elem[full.elems], nil
 		}
-		c.globalUnlock()
-	} // else The local pool was empty and we could not acquire the globalLock.
+	}
+	if x == nil {
+		atomic.AddInt64(&l.missing, 1)
+	}
 
 	runtime_procUnpin()
 
@@ -213,25 +201,15 @@ func (c *Cache) pinSlow() *cacheLocal {
 	return &local[pid]
 }
 
-// globalLockIfUnlocked attempts to lock the globalLock. If the globalLock is
-// already locked it returns false. Otherwise it locks it and returns true.
-// This function is very similar to try_lock in POSIX, and it is equivalent
-// to the uncontended fast path of Mutex.Lock. If this function returns true
-// the caller has to call c.globalUnlock() to unlock the globalLock.
-func (c *Cache) globalLockIfUnlocked() bool {
-	if atomic.CompareAndSwapUintptr(&c.globalLock, globalUnlocked, globalLocked) {
-		// TODO RACE
-		return true
+// Missing returns the total Get missing count of all per-P shards.
+func (c *Cache) Missing() (missing int64) {
+	s := atomic.LoadUintptr(&c.localSize) // load-acquire
+	l := c.local                          // load-consume
+	for i := 0; i < int(s); i++ {
+		ll := indexLocal(l, i)
+		missing += atomic.LoadInt64(&ll.missing)
 	}
-	return false
-}
-
-// globalUnlcok unlocks the globalLock. Calling this function should be done
-// only if the last call to c.globalLockIfUnlocked() returned true: its behavior
-// is otherwise undefined.
-func (c *Cache) globalUnlock() {
-	// TODO RACE
-	atomic.StoreUintptr(&c.globalLock, globalUnlocked)
+	return
 }
 
 func indexLocal(l unsafe.Pointer, i int) *cacheLocal {
