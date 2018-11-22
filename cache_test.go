@@ -15,6 +15,9 @@ func TestAlign(t *testing.T) {
 	if unsafe.Sizeof(cacheShard{})%128 != 0 {
 		t.Fatal("cacheShard is not aligned with 128")
 	}
+	if unsafe.Sizeof(cacheLocal{})%128 != 0 {
+		t.Fatal("cacheLocal is not aligned with 128")
+	}
 }
 
 func TestCacheConcurrent(t *testing.T) {
