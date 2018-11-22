@@ -9,6 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"unsafe"
+
+	"github.com/lrita/cache/race"
 )
 
 // Cache is a set of temporary objects that may be individually saved and
@@ -84,8 +86,13 @@ func (c *Cache) Put(x interface{}) {
 	if x == nil {
 		return
 	}
-	// TODO RACE
+
 	l := c.pin()
+
+	if race.Enabled {
+		race.Acquire(unsafe.Pointer(l))
+	}
+
 	if l.elems < cacheShardSize {
 		l.elem[l.elems] = x
 		l.elems++
@@ -114,6 +121,10 @@ func (c *Cache) Put(x interface{}) {
 		l.next.elems = 1
 	} // else: drop it on the floor.
 
+	if race.Enabled {
+		race.Release(unsafe.Pointer(l))
+	}
+
 	runtime_procUnpin()
 	// TODO RACE
 }
@@ -127,8 +138,12 @@ func (c *Cache) Put(x interface{}) {
 // If Get would otherwise return nil and p.New is non-nil, Get returns
 // the result of calling p.New.
 func (c *Cache) Get() (x interface{}) {
-	// TODO RACE
 	l := c.pin()
+
+	if race.Enabled {
+		race.Acquire(unsafe.Pointer(l))
+	}
+
 	if l.elems > 0 {
 		l.elems--
 		x, l.elem[l.elems] = l.elem[l.elems], nil
@@ -156,6 +171,10 @@ func (c *Cache) Get() (x interface{}) {
 		atomic.AddInt64(&l.missing, 1)
 	}
 
+	if race.Enabled {
+		race.Release(unsafe.Pointer(l))
+	}
+
 	runtime_procUnpin()
 
 	if x == nil && c.New != nil {
@@ -173,7 +192,7 @@ func (c *Cache) pin() *cacheLocal {
 	// Thus here we must observe local at least as large localSize.
 	// We can observe a newer/larger local, it is fine (we must observe its zero-initialized-ness).
 	s := atomic.LoadUintptr(&c.localSize) // load-acquire
-	l := c.local                          // load-consume
+	l := atomic.LoadPointer(&c.local)     // load-acquire
 	if uintptr(pid) < s {
 		return indexLocal(l, pid)
 	}
@@ -204,7 +223,7 @@ func (c *Cache) pinSlow() *cacheLocal {
 // Missing returns the total Get missing count of all per-P shards.
 func (c *Cache) Missing() (missing int64) {
 	s := atomic.LoadUintptr(&c.localSize) // load-acquire
-	l := c.local                          // load-consume
+	l := atomic.LoadPointer(&c.local)     // load-acquire
 	for i := 0; i < int(s); i++ {
 		ll := indexLocal(l, i)
 		missing += atomic.LoadInt64(&ll.missing)

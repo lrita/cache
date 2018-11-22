@@ -1,13 +1,11 @@
-// Copyright 2013 The Go Authors. All rights reserved.
+// Copyright 2018 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
-
-// Pool is no-op under race detector, so all these tests do not work.
-// +build !race
 
 package cache
 
 import (
+	"runtime"
 	"sync"
 	"testing"
 	"unsafe"
@@ -17,6 +15,34 @@ func TestAlign(t *testing.T) {
 	if unsafe.Sizeof(cacheShard{})%128 != 0 {
 		t.Fatal("cacheShard is not aligned with 128")
 	}
+}
+
+func TestCacheConcurrent(t *testing.T) {
+	type obj struct {
+		x int
+	}
+	var (
+		wg sync.WaitGroup
+		n  = 2 * runtime.GOMAXPROCS(0)
+		c  = &Cache{New: func() interface{} { return new(obj) }}
+	)
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				o := c.Get().(*obj)
+				o.x = 1
+				runtime.Gosched()
+				c.Put(o)
+				runtime.Gosched()
+			}
+		}()
+	}
+	_ = c.Missing()
+	wg.Wait()
+	_ = c.Missing()
 }
 
 func TestPool(t *testing.T) {
