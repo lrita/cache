@@ -1,4 +1,4 @@
-doc: https://godoc.org/github.com/lrita/cache
+[![Build Status](https://travis-ci.org/lrita/cache.svg?branch=master)](https://travis-ci.org/lrita/cache) doc: https://godoc.org/github.com/lrita/cache
 
 # Cache
 
