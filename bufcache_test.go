@@ -40,9 +40,7 @@ func TestBufCacheConcurrent(t *testing.T) {
 			}
 		}()
 	}
-	_ = c.Missing()
 	wg.Wait()
-	_ = c.Missing()
 }
 
 func TestBufCache(t *testing.T) {
@@ -148,6 +146,24 @@ func TestBufCacheStress(t *testing.T) {
 	}
 }
 
+// improve test coverage...
+func TestBufCacheFillFull(t *testing.T) {
+	c := BufCache{Size: bufCacheShardSize}
+	d := make([]byte, 8)
+	for i := 0; i < bufCacheShardSize*4; i++ {
+		c.Put(d)
+	}
+	for i := 0; i < bufCacheShardSize*4; i++ {
+		c.Get()
+	}
+	for i := 0; i < bufCacheShardSize*4; i++ {
+		c.Put(d)
+	}
+	for i := 0; i < bufCacheShardSize*4; i++ {
+		c.Get()
+	}
+}
+
 func BenchmarkBufCache(b *testing.B) {
 	var c BufCache
 	a := make([]byte, 8)
@@ -172,7 +188,6 @@ func BenchmarkBufCacheOverflow(b *testing.B) {
 			}
 		}
 	})
-	b.Log("missing", c.Missing())
 }
 
 func BenchmarkBufCacheUnderflowUnbalanced(b *testing.B) {
@@ -223,7 +238,6 @@ func BenchmarkBufCacheSize100Overflow(b *testing.B) {
 			}
 		}
 	})
-	b.Log("missing", c.Missing())
 }
 
 func BenchmarkBufCacheSize100UnderflowUnbalanced(b *testing.B) {
@@ -274,7 +288,6 @@ func BenchmarkBufCacheSize1KOverflow(b *testing.B) {
 			}
 		}
 	})
-	b.Log("missing", c.Missing())
 }
 
 func BenchmarkBufCacheSize1KUnderflowUnbalanced(b *testing.B) {

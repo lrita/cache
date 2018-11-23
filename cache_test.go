@@ -43,9 +43,7 @@ func TestCacheConcurrent(t *testing.T) {
 			}
 		}()
 	}
-	_ = c.Missing()
 	wg.Wait()
-	_ = c.Missing()
 }
 
 func TestPool(t *testing.T) {
@@ -92,6 +90,23 @@ func TestPool(t *testing.T) {
 		}
 	}
 	runtime_procUnpin()
+}
+
+// improve test coverage...
+func TestCacheFillFull(t *testing.T) {
+	c := Cache{Size: cacheShardSize}
+	for i := 0; i < cacheShardSize*4; i++ {
+		c.Put(1)
+	}
+	for i := 0; i < cacheShardSize*4; i++ {
+		c.Get()
+	}
+	for i := 0; i < cacheShardSize*4; i++ {
+		c.Put(1)
+	}
+	for i := 0; i < cacheShardSize*4; i++ {
+		c.Get()
+	}
 }
 
 func TestPoolNew(t *testing.T) {
@@ -175,7 +190,6 @@ func BenchmarkCacheOverflow(b *testing.B) {
 			}
 		}
 	})
-	b.Log("missing", c.Missing())
 }
 
 func BenchmarkCacheUnderflowUnbalanced(b *testing.B) {
@@ -222,7 +236,6 @@ func BenchmarkCacheSize100Overflow(b *testing.B) {
 			}
 		}
 	})
-	b.Log("missing", c.Missing())
 }
 
 func BenchmarkCacheSize100UnderflowUnbalanced(b *testing.B) {
@@ -269,7 +282,6 @@ func BenchmarkCacheSize1KOverflow(b *testing.B) {
 			}
 		}
 	})
-	b.Log("missing", c.Missing())
 }
 
 func BenchmarkCacheSize1KUnderflowUnbalanced(b *testing.B) {

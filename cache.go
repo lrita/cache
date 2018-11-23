@@ -32,7 +32,7 @@ import (
 // deallocated by GC, and there are multi slot in per-P storage. The free list
 // in Cache maintained as parts of a long-lived object aim for a long process
 // logic. The users can twist the per-P local size(Cache.Size) to make minimum
-// allocation by the Get-missing statistic method Cache.Missing().
+// allocation by profile.
 //
 // A Cache must not be copied after first use.
 type Cache struct {
@@ -81,8 +81,6 @@ type cacheLocalInternal struct {
 	localSize  int64       // local size of full shards
 	localFull  *cacheShard // local pool of full shards (elems == cacheShardSize)
 	localEmpty *cacheShard // local pool of empty shards (elems == 0)
-	_          [5]int64    // pad cacheline
-	missing    int64       // local missing count
 }
 
 type cacheLocal struct {
@@ -177,9 +175,6 @@ func (c *Cache) Get() (x interface{}) {
 			x, full.elem[full.elems] = full.elem[full.elems], nil
 		}
 	}
-	if x == nil {
-		atomic.AddInt64(&l.missing, 1)
-	}
 
 	if race.Enabled {
 		race.Release(unsafe.Pointer(l))
@@ -187,8 +182,11 @@ func (c *Cache) Get() (x interface{}) {
 
 	runtime_procUnpin()
 
-	if x == nil && c.New != nil {
-		x = c.New()
+	if x == nil {
+		getmissingevent()
+		if c.New != nil {
+			x = c.New()
+		}
 	}
 	return x
 }
@@ -228,17 +226,6 @@ func (c *Cache) pinSlow() *cacheLocal {
 	atomic.StorePointer(&c.local, unsafe.Pointer(&local[0])) // store-release
 	atomic.StoreUintptr(&c.localSize, uintptr(size))         // store-release
 	return &local[pid]
-}
-
-// Missing returns the total Get missing count of all per-P shards.
-func (c *Cache) Missing() (missing int64) {
-	s := atomic.LoadUintptr(&c.localSize) // load-acquire
-	l := atomic.LoadPointer(&c.local)     // load-acquire
-	for i := 0; i < int(s); i++ {
-		ll := indexLocal(l, i)
-		missing += atomic.LoadInt64(&ll.missing)
-	}
-	return
 }
 
 func indexLocal(l unsafe.Pointer, i int) *cacheLocal {

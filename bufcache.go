@@ -32,7 +32,7 @@ import (
 // deallocated by GC, and there are multi slot in per-P storage. The free list
 // in BufCache maintained as parts of a long-lived object aim for a long process
 // logic. The users can twist the per-P local size(BufCache.Size) to make minimum
-// allocation by the Get-missing statistic method BufCache.Missing().
+// allocation by the profile.
 //
 // A BufCache must not be copied after first use.
 //
@@ -84,8 +84,6 @@ type bufCacheLocalInternal struct {
 	localSize  int64          // local size of full shards
 	localFull  *bufCacheShard // local pool of full shards (elems == bufCacheShardSize)
 	localEmpty *bufCacheShard // local pool of empty shards (elems == 0)
-	_          [5]int64       // pad bufCacheline
-	missing    int64          // local missing count
 }
 
 type bufCacheLocal struct {
@@ -180,9 +178,6 @@ func (c *BufCache) Get() (x []byte) {
 			x, full.elem[full.elems] = full.elem[full.elems], nil
 		}
 	}
-	if x == nil {
-		atomic.AddInt64(&l.missing, 1)
-	}
 
 	if race.Enabled {
 		race.Release(unsafe.Pointer(l))
@@ -190,8 +185,11 @@ func (c *BufCache) Get() (x []byte) {
 
 	runtime_procUnpin()
 
-	if x == nil && c.New != nil {
-		x = c.New()
+	if x == nil {
+		getmissingevent()
+		if c.New != nil {
+			x = c.New()
+		}
 	}
 	return x
 }
@@ -231,17 +229,6 @@ func (c *BufCache) pinSlow() *bufCacheLocal {
 	atomic.StorePointer(&c.local, unsafe.Pointer(&local[0])) // store-release
 	atomic.StoreUintptr(&c.localSize, uintptr(size))         // store-release
 	return &local[pid]
-}
-
-// Missing returns the total Get missing count of all per-P shards.
-func (c *BufCache) Missing() (missing int64) {
-	s := atomic.LoadUintptr(&c.localSize) // load-acquire
-	l := atomic.LoadPointer(&c.local)     // load-acquire
-	for i := 0; i < int(s); i++ {
-		ll := bufindexLocal(l, i)
-		missing += atomic.LoadInt64(&ll.missing)
-	}
-	return
 }
 
 func bufindexLocal(l unsafe.Pointer, i int) *bufCacheLocal {
