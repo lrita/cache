@@ -1,4 +1,4 @@
-[![Build Status](https://travis-ci.org/lrita/cache.svg?branch=master)](https://travis-ci.org/lrita/cache) doc: https://godoc.org/github.com/lrita/cache
+[![Build Status](https://travis-ci.org/lrita/cache.svg?branch=master)](https://travis-ci.org/lrita/cache) [![GoDoc](https://godoc.org/github.com/lrita/cache?status.png)](https://godoc.org/github.com/lrita/cache) [![codecov](https://codecov.io/gh/lrita/cache/branch/master/graph/badge.svg)](https://codecov.io/gh/lrita/cache)
 
 # Cache
 
