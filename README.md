@@ -18,9 +18,10 @@ clients of a package. Cache provides a way to amortize allocation overhead
 across many clients.
 
 The difference with std-lib sync.Pool is that the items in Cache does not be
-deallocated by GC, and there are multi slot in per-P storage. The free list
-in Cache maintained as parts of a long-lived object aim for a long process
-logic.
+deallocated by GC, and there are multi slot in per-P storage and per-NUMA
+node storage. The free list in Cache maintained as parts of a long-lived
+object aim for a long process logic. The users can twist the per-NUMA node
+size(Cache.Size) to make minimum allocation by profile.
 
 example gist:
 ```go

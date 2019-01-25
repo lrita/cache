@@ -1,4 +1,4 @@
-// Copyright 2018 The Go Authors. All rights reserved.
+// Copyright 2019 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -11,6 +11,7 @@ import (
 	"unsafe"
 
 	"github.com/lrita/cache/race"
+	"github.com/lrita/numa"
 )
 
 // Cache is a set of temporary objects that may be individually saved and
@@ -29,14 +30,16 @@ import (
 // across many clients.
 //
 // The difference with std-lib sync.Pool is that the items in Cache does not be
-// deallocated by GC, and there are multi slot in per-P storage. The free list
-// in Cache maintained as parts of a long-lived object aim for a long process
-// logic. The users can twist the per-P local size(Cache.Size) to make minimum
-// allocation by profile.
+// deallocated by GC, and there are multi slot in per-P storage and per-NUMA
+// node storage. The free list in Cache maintained as parts of a long-lived
+// object aim for a long process logic. The users can twist the per-NUMA node
+// size(Cache.Size) to make minimum allocation by profile.
 //
 // A Cache must not be copied after first use.
 type Cache struct {
 	noCopy noCopy
+
+	nodes unsafe.Pointer // per-NUMA NODE pool, actual type is [N]cacheNode
 
 	local     unsafe.Pointer // local fixed-size per-P pool, actual type is [P]cacheLocal
 	localSize uintptr        // size of the local array
@@ -46,11 +49,13 @@ type Cache struct {
 	// a value when Get would otherwise return nil.
 	// It may not be changed concurrently with calls to Get.
 	New func() interface{}
-	// Size optinally specifies the max items in the per-P local lists.
+	// Size optinally specifies the max items in the per-NUMA NODE lists.
 	Size int64
 }
 
 const (
+	locked   int64 = 1
+	unlocked       = 0
 	// interface{} is 16 bytes wide on 64bit platforms,
 	// leaving only 7 slots per 128 bytes cache line.
 	cacheShardSize = 7 // number of elements per shard
@@ -75,19 +80,36 @@ type cacheShard struct {
 	_ [128 - unsafe.Sizeof(cacheShardInternal{})%128]byte
 }
 
-type cacheLocalInternal struct {
-	cacheShard
+type cacheLocal cacheShard
 
-	localSize  int64       // local size of full shards
-	localFull  *cacheShard // local pool of full shards (elems == cacheShardSize)
-	localEmpty *cacheShard // local pool of empty shards (elems == 0)
+type cacheNodeInternal struct {
+	lock  int64
+	_     [7]int64
+	size  int64       // node size of full shards
+	full  *cacheShard // node pool of full shards (elems == cacheShardSize)
+	empty *cacheShard // node pool of empty shards (elems == 0)
 }
 
-type cacheLocal struct {
-	cacheLocalInternal
+func (c *cacheNodeInternal) trylock() bool {
+	ok := atomic.CompareAndSwapInt64(&c.lock, unlocked, locked)
+	if race.Enabled && ok {
+		race.Acquire(unsafe.Pointer(c))
+	}
+	return ok
+}
+
+func (c *cacheNodeInternal) unlock() {
+	if race.Enabled {
+		race.Release(unsafe.Pointer(c))
+	}
+	atomic.StoreInt64(&c.lock, unlocked)
+}
+
+type cacheNode struct {
+	cacheNodeInternal
 	// Prevents false sharing on widespread platforms with
 	// 128 mod (cache line size) = 0.
-	_ [128 - unsafe.Sizeof(cacheLocalInternal{})%128]byte
+	_ [128 - unsafe.Sizeof(cacheNodeInternal{})%128]byte
 }
 
 // Put adds x to the Cache.
@@ -108,26 +130,39 @@ func (c *Cache) Put(x interface{}) {
 	} else if next := l.next; next != nil && next.elems < cacheShardSize {
 		next.elem[next.elems] = x
 		next.elems++
-	} else if l.localSize < c.Size {
-		if full := l.next; full != nil {
-			// The l.next shard is full: move it to the full list.
-			l.next = nil
-			full.next = l.localFull
-			l.localFull = full
-			l.localSize += cacheShardSize
+	} else if c.Size > 0 {
+		n := c.node()
+		if atomic.LoadInt64(&n.size) < c.Size && n.trylock() {
+			// There is no space in the private pool but we were able to acquire
+			// the node lock, so we can try to move shards to/from the local
+			// node pool.
+			if full := l.next; full != nil {
+				// The l.next shard is full: move it to the node pool.
+				l.next = nil
+				full.next = n.full
+				n.full = full
+				atomic.AddInt64(&n.size, cacheShardSize)
+			}
+			if n.size < c.Size { // double check
+				if empty := n.empty; empty != nil {
+					// Grab a reusable empty shard from the node empty pool and move it
+					// to the private pool.
+					n.empty = empty.next
+					empty.next = nil
+					l.next = empty
+					n.unlock()
+				} else {
+					// The node empty pool contains no reusable shards: allocate a new
+					// empty shard.
+					n.unlock()
+					l.next = &cacheShard{}
+				}
+				l.next.elem[0] = x
+				l.next.elems = 1
+			} else {
+				n.unlock()
+			}
 		}
-		if empty := l.localEmpty; empty != nil {
-			// Grab a reusable empty shard from the localEmpty list and move it
-			// to the private pool.
-			l.localEmpty = empty.next
-			empty.next = nil
-			l.next = empty
-		} else {
-			// No reusable shards: allocate a new empty shard.
-			l.next = &cacheShard{}
-		}
-		l.next.elem[0] = x
-		l.next.elems = 1
 	} // else: drop it on the floor.
 
 	if race.Enabled {
@@ -158,21 +193,27 @@ func (c *Cache) Get() (x interface{}) {
 	} else if next := l.next; next != nil && next.elems > 0 {
 		next.elems--
 		x, next.elem[next.elems] = next.elem[next.elems], nil
-	} else if l.localSize > 0 {
-		if empty := l.next; empty != nil {
-			// The l.next shard is empty: move it to the localEmpty list.
-			l.next = nil
-			empty.next = l.localEmpty
-			l.localEmpty = empty
-		}
-		// Grab full shard from localFull
-		if full := l.localFull; full != nil {
-			l.localFull = full.next
-			full.next = nil
-			l.next = full
-			l.localSize -= cacheShardSize
-			full.elems--
-			x, full.elem[full.elems] = full.elem[full.elems], nil
+	} else if c.Size > 0 {
+		n := c.node()
+		if atomic.LoadInt64(&n.size) > 0 && n.trylock() {
+			// The private pool is empty but we were able to acquire the node
+			// lock, so we can try to move shards to/from the node pools.
+			if empty := l.next; empty != nil {
+				// The l.next shard is empty: move it to the node empty pool.
+				l.next = nil
+				empty.next = n.empty
+				n.empty = empty
+			}
+			// Grab full shard from global pool and obtain x from it.
+			if full := n.full; full != nil {
+				n.full = full.next
+				full.next = nil
+				l.next = full
+				atomic.AddInt64(&n.size, -cacheShardSize)
+				full.elems--
+				x, full.elem[full.elems] = full.elem[full.elems], nil
+			}
+			n.unlock()
 		}
 	}
 
@@ -189,6 +230,13 @@ func (c *Cache) Get() (x interface{}) {
 		}
 	}
 	return x
+}
+
+func (c *Cache) node() *cacheNode {
+	n := atomic.LoadPointer(&c.nodes) // load-acquire
+	_, nn := numa.GetCPUAndNode()
+	np := unsafe.Pointer(uintptr(n) + uintptr(nn)*unsafe.Sizeof(cacheNode{}))
+	return (*cacheNode)(np)
 }
 
 // pin pins the current goroutine to P, disables preemption and returns cacheLocal
@@ -223,6 +271,8 @@ func (c *Cache) pinSlow() *cacheLocal {
 	// If GOMAXPROCS changes between GCs, we re-allocate the array and lose the old one.
 	size := runtime.GOMAXPROCS(0)
 	local := make([]cacheLocal, size)
+	nodes := make([]cacheNode, numa.MaxNodeID()+1)
+	atomic.StorePointer(&c.nodes, unsafe.Pointer(&nodes[0])) // store-release
 	atomic.StorePointer(&c.local, unsafe.Pointer(&local[0])) // store-release
 	atomic.StoreUintptr(&c.localSize, uintptr(size))         // store-release
 	return &local[pid]
