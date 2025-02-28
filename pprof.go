@@ -5,15 +5,11 @@
 package cache
 
 import (
-	"bufio"
-	"fmt"
 	"io"
 	"runtime"
 	"runtime/pprof"
-	"sort"
 	"sync"
 	"sync/atomic"
-	"text/tabwriter"
 	"unsafe"
 )
 
@@ -25,14 +21,15 @@ var (
 	events map[runtime.StackRecord]*runtime.BlockProfileRecord
 )
 
+type profilehook struct {
+	name  string
+	mu    sync.Mutex
+	m     map[interface{}][]uintptr
+	count func() int
+	write func(io.Writer, int) error
+}
+
 func init() {
-	type profilehook struct {
-		name  string
-		mu    sync.Mutex
-		m     map[interface{}][]uintptr
-		count func() int
-		write func(io.Writer, int) error
-	}
 	(*profilehook)(unsafe.Pointer(profile)).count = cacheProfileCount
 	(*profilehook)(unsafe.Pointer(profile)).write = cacheProfileWrite
 }
@@ -40,46 +37,28 @@ func init() {
 func cacheProfileCount() int {
 	evtsmu.Lock()
 	defer evtsmu.Unlock()
-	return len(events)
+	count := int64(0)
+	for _, evt := range events {
+		count += evt.Count
+	}
+	return int(count)
 }
 
 func cacheProfileWrite(w io.Writer, debug int) error {
+	n := uintptr(0)
+	dummy := pprof.Profile{}
+	hook := (*profilehook)(unsafe.Pointer(&dummy))
+	hook.name = "github.com/lrita/cache"
+	hook.m = make(map[interface{}][]uintptr)
 	evtsmu.Lock()
-	p := make([]runtime.BlockProfileRecord, 0, len(events))
 	for _, evt := range events {
-		p = append(p, *evt)
+		for i := int64(0); i < evt.Count; i++ {
+			hook.m[n] = evt.Stack()
+			n++
+		}
 	}
 	evtsmu.Unlock()
-
-	sort.Slice(p, func(i, j int) bool { return p[i].Cycles > p[j].Cycles })
-
-	if debug <= 0 {
-		return printCountCycleProfile(w, "count", "missing", scaleNothing, p)
-	}
-
-	b := bufio.NewWriter(w)
-	tw := tabwriter.NewWriter(w, 1, 8, 1, '\t', 0)
-	w = tw
-
-	fmt.Fprintf(w, "--- github.com/lrita/cache:\n")
-	fmt.Fprintf(w, "cycles/second=%v\n", 1)
-	fmt.Fprintf(w, "sampling period=%d\n", SetProfileFraction(-1))
-	for i := range p {
-		r := &p[i]
-		fmt.Fprintf(w, "%v %v @", r.Cycles, r.Count)
-		for _, pc := range r.Stack() {
-			fmt.Fprintf(w, " %#x", pc)
-		}
-		fmt.Fprint(w, "\n")
-		if debug > 0 {
-			printStackRecord(w, r.Stack(), true)
-		}
-	}
-
-	if tw != nil {
-		tw.Flush()
-	}
-	return b.Flush()
+	return dummy.WriteTo(w, debug)
 }
 
 // SetProfileFraction controls the fraction of cache get missing events
@@ -115,7 +94,6 @@ func getmissingevent() {
 	}
 
 	evtsmu.Lock()
-	defer evtsmu.Unlock()
 	evt, ok := events[stk]
 	if !ok {
 		evt = &runtime.BlockProfileRecord{StackRecord: stk}
@@ -125,18 +103,5 @@ func getmissingevent() {
 		events[stk] = evt
 	}
 	evt.Count++
-	evt.Cycles++
+	evtsmu.Unlock()
 }
-
-func scaleNothing(cnt int64, ns float64) (int64, float64) { return cnt, ns }
-
-// from runtime
-//go:linkname fastrand runtime.fastrand
-func fastrand() uint32
-
-//go:linkname printStackRecord runtime/pprof.printStackRecord
-func printStackRecord(io.Writer, []uintptr, bool)
-
-//go:linkname printCountCycleProfile runtime/pprof.printCountCycleProfile
-func printCountCycleProfile(io.Writer, string, string,
-	func(int64, float64) (int64, float64), []runtime.BlockProfileRecord) error
